@@ -1,0 +1,470 @@
+===== api/main.py =====
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+import redis
+import yt_dlp
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/codeviser")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://youtube.com/@codeviser")
+MIN_LONG_SECONDS = int(os.getenv("MIN_LONG_SECONDS", "180"))
+START_DATE = os.getenv("START_DATE", "2017-01-01")
+END_DATE = os.getenv("END_DATE", "2026-10-08")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+rdb = redis.from_url(REDIS_URL, decode_responses=True)
+
+class Base(DeclarativeBase):
+    pass
+
+class Video(Base):
+    __tablename__ = "videos"
+    video_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_date: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    video_type: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    date_status: Mapped[str] = mapped_column(String(30), default="UNKNOWN_DATE")
+    caption_status: Mapped[str] = mapped_column(String(40), default="NOT_CHECKED")
+    transcript_status: Mapped[str] = mapped_column(String(40), default="PENDING")
+    analysis_status: Mapped[str] = mapped_column(String(40), default="PENDING")
+    transcript_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+Base.metadata.create_all(engine)
+
+app = FastAPI(title="Codeviser Research Engine API", version="1.0.0")
+
+
+def discover(limit: int = 25) -> int:
+    """Discover a small real inventory. Full discovery can be enabled later."""
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "playlistend": limit,
+        "ignoreerrors": True,
+    }
+    count = 0
+    with yt_dlp.YoutubeDL(opts) as ydl, Session(engine) as db:
+        info = ydl.extract_info(CHANNEL_URL, download=False)
+        entries = (info or {}).get("entries") or []
+        for item in entries:
+            if not item or not item.get("id"):
+                continue
+            vid = str(item["id"])
+            duration = item.get("duration")
+            upload_date = item.get("upload_date")
+            video_type = "LONG" if duration is not None and duration >= MIN_LONG_SECONDS else ("SHORT" if duration is not None else "UNKNOWN")
+            date_status = "KNOWN_DATE" if upload_date else "UNKNOWN_DATE"
+            obj = db.get(Video, vid)
+            if obj is None:
+                obj = Video(video_id=vid)
+                db.add(obj)
+            obj.title = item.get("title") or obj.title or ""
+            obj.url = item.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+            obj.duration = duration
+            obj.upload_date = upload_date
+            obj.video_type = video_type
+            obj.date_status = date_status
+            count += 1
+        db.commit()
+    return count
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    with Session(engine) as db:
+        db.execute(select(func.count()).select_from(Video)).scalar_one()
+    rdb.ping()
+    return {"status": "ok", "service": "api"}
+
+@app.get("/stats")
+def stats() -> dict[str, Any]:
+    with Session(engine) as db:
+        total = db.scalar(select(func.count()).select_from(Video)) or 0
+        long_total = db.scalar(select(func.count()).select_from(Video).where(Video.video_type == "LONG")) or 0
+        queued = db.scalar(select(func.count()).select_from(Video).where(Video.queued.is_(True), Video.completed.is_(False))) or 0
+        completed = db.scalar(select(func.count()).select_from(Video).where(Video.completed.is_(True))) or 0
+        unknown_date_long = db.scalar(select(func.count()).select_from(Video).where(Video.video_type == "LONG", Video.date_status == "UNKNOWN_DATE")) or 0
+        no_caption = db.scalar(select(func.count()).select_from(Video).where(Video.caption_status == "NO_CAPTION")) or 0
+        return {"total": total, "long": long_total, "queued": queued, "completed": completed,
+                "unknown_date_long": unknown_date_long, "no_caption": no_caption,
+                "progress": round((completed / queued * 100), 2) if queued else 0}
+
+@app.post("/research/discover")
+def run_discover() -> dict[str, Any]:
+    n = discover()
+    return {"discovered_or_updated": n}
+
+@app.post("/research/start")
+def start_research() -> dict[str, Any]:
+    with Session(engine) as db:
+        # Date is deliberately NOT required. LONG classification is independent.
+        q = select(Video).where(Video.video_type == "LONG", Video.completed.is_(False))
+        videos = list(db.scalars(q).all())
+        smoke_only = os.getenv("SMOKE_ONLY", "true").lower() == "true"
+        limit = int(os.getenv("SMOKE_LIMIT", "1")) if smoke_only else len(videos)
+        selected = videos[:limit]
+        if not selected:
+            raise HTTPException(409, "No eligible LONG videos in the existing inventory")
+        for v in selected:
+            v.queued = True
+            db.add(v)
+            rdb.rpush("codeviser:queue", v.video_id)
+        db.commit()
+    return {"queued": len(selected), "smoke_only": smoke_only, "message": "Worker will process queued videos asynchronously."}
+
+@app.get("/videos")
+def videos(limit: int = 50) -> list[dict[str, Any]]:
+    with Session(engine) as db:
+        rows = db.scalars(select(Video).order_by(Video.created_at.desc()).limit(min(limit, 200))).all()
+        return [{"video_id": v.video_id, "title": v.title, "video_type": v.video_type,
+                 "date_status": v.date_status, "duration": v.duration,
+                 "caption_status": v.caption_status, "transcript_status": v.transcript_status,
+                 "analysis_status": v.analysis_status, "completed": v.completed} for v in rows]
+
+
+===== api/requirements.txt =====
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+psycopg[binary]==3.2.3
+redis==5.2.1
+pydantic==2.10.5
+pydantic-settings==2.7.1
+yt-dlp==2025.1.26
+httpx==0.28.1
+
+
+===== api/Dockerfile =====
+FROM python:3.13-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+===== worker/worker.py =====
+import json
+import os
+import re
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import redis
+import yt_dlp
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/codeviser")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+rdb = redis.from_url(REDIS_URL, decode_responses=True)
+TRANSCRIPT_DIR = Path(os.getenv("TRANSCRIPT_DIR", "/data/transcripts"))
+TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+
+class Base(DeclarativeBase): pass
+class Video(Base):
+    __tablename__ = "videos"
+    video_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_date: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    video_type: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    date_status: Mapped[str] = mapped_column(String(30), default="UNKNOWN_DATE")
+    caption_status: Mapped[str] = mapped_column(String(40), default="NOT_CHECKED")
+    transcript_status: Mapped[str] = mapped_column(String(40), default="PENDING")
+    analysis_status: Mapped[str] = mapped_column(String(40), default="PENDING")
+    transcript_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    queued: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+Base.metadata.create_all(engine)
+
+PREFERRED = ["hi", "en", "gu"]
+
+def clean_caption_text(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = re.sub(r"WEBVTT.*?\n", "", text, flags=re.I)
+    text = re.sub(r"\d{2}:\d{2}:\d{2}[.,]\d{3} --> .*", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    lines, seen = [], set()
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line.isdigit() or line in seen:
+            continue
+        seen.add(line); lines.append(line)
+    return "\n".join(lines).strip()
+
+def get_captions(video_id: str, url: str, outdir: Path) -> Path | None:
+    # Prefer Hindi/English/Gujarati, but allow any public caption language.
+    common = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": PREFERRED + [".*"],
+        "subtitlesformat": "vtt",
+        "outtmpl": str(outdir / f"{video_id}.%(ext)s"),
+        "quiet": True,
+        "ignoreerrors": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(common) as ydl:
+            ydl.download([url])
+    except Exception:
+        return None
+    candidates = sorted(outdir.glob(f"{video_id}*.vtt"))
+    if not candidates:
+        return None
+    preferred = [p for lang in PREFERRED for p in candidates if f".{lang}." in p.name]
+    return preferred[0] if preferred else candidates[0]
+
+def analyze(text: str, title: str) -> str:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        return "SKIPPED_NO_API_KEY"
+    from openai import OpenAI
+    client = OpenAI(api_key=key)
+    model = os.getenv("OPENAI_MODEL", "gpt-5.4")
+    prompt = ("Analyze only the supplied evidence. Extract trading methodology, setup, "
+              "confirmation, entry, stop, target, timeframe and invalidation. "
+              "Do not invent missing facts. Return concise structured JSON.\n\n"
+              f"TITLE: {title}\nTRANSCRIPT:\n{text[:30000]}")
+    result = client.responses.create(model=model, input=prompt)
+    return result.output_text
+
+def process(video_id: str) -> None:
+    with Session(engine) as db:
+        v = db.get(Video, video_id)
+        if not v:
+            return
+        v.error = None
+        db.commit()
+        url, title = v.url, v.title
+    with tempfile.TemporaryDirectory(prefix=f"cv_{video_id}_") as td:
+        tmp = Path(td)
+        with Session(engine) as db:
+            v = db.get(Video, video_id); v.caption_status = "CHECKING"; db.commit()
+        cap = get_captions(video_id, url, tmp)
+        with Session(engine) as db:
+            v = db.get(Video, video_id)
+            if cap is None:
+                v.caption_status = "NO_CAPTION"
+                v.transcript_status = "NO_CAPTION"
+                v.analysis_status = "SKIPPED_NO_TRANSCRIPT"
+            else:
+                text = clean_caption_text(cap)
+                transcript = TRANSCRIPT_DIR / f"{video_id}.txt"
+                transcript.write_text(text, encoding="utf-8")
+                v.caption_status = "FOUND"
+                v.transcript_status = "COMPLETED"
+                v.transcript_path = str(transcript)
+                v.analysis_status = "COMPLETED" if analyze(text, title) != "SKIPPED_NO_API_KEY" else "SKIPPED_NO_API_KEY"
+            v.completed = True
+            v.queued = False
+            v.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
+def main() -> None:
+    print("WORKER_STARTED", flush=True)
+    while True:
+        video_id = rdb.blpop("codeviser:queue", timeout=30)
+        if not video_id:
+            continue
+        _, vid = video_id
+        print(f"VIDEO_STARTED={vid}", flush=True)
+        try:
+            process(vid)
+            print(f"VIDEO_COMPLETED={vid}", flush=True)
+        except Exception as exc:
+            with Session(engine) as db:
+                v = db.get(Video, vid)
+                if v:
+                    v.error = repr(exc); v.queued = False; db.commit()
+            print(f"VIDEO_FAILED={vid} error={exc!r}", flush=True)
+
+if __name__ == "__main__":
+    main()
+
+
+===== worker/requirements.txt =====
+sqlalchemy==2.0.36
+psycopg[binary]==3.2.3
+redis==5.2.1
+yt-dlp==2025.1.26
+openai==1.59.7
+opencv-python-headless==4.10.0.84
+pytesseract==0.3.13
+Pillow==11.1.0
+
+
+===== worker/Dockerfile =====
+FROM python:3.13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY worker.py .
+CMD ["python", "worker.py"]
+
+
+===== web/app/page.tsx =====
+'use client';
+import { useEffect, useState } from 'react';
+
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+export default function Home() {
+  const [stats,setStats]=useState<any>(null); const [msg,setMsg]=useState('Ready');
+  async function refresh(){try{const r=await fetch(`${API}/stats`); setStats(await r.json());}catch(e){setMsg('API not reachable');}}
+  async function discover(){setMsg('Discovering...'); try{await fetch(`${API}/research/discover`,{method:'POST'});setMsg('Discovery finished');await refresh();}catch(e){setMsg('Discovery failed');}}
+  async function start(){setMsg('Queueing one smoke-test video...'); try{const r=await fetch(`${API}/research/start`,{method:'POST'}); const d=await r.json(); setMsg(d.message||'Started');await refresh();}catch(e){setMsg('Start failed');}}
+  useEffect(()=>{refresh(); const t=setInterval(refresh,5000); return()=>clearInterval(t)},[]);
+  return <main style={{fontFamily:'system-ui',maxWidth:900,margin:'40px auto',padding:20}}>
+    <h1>CODEVISER RESEARCH ENGINE</h1><p>Real queue + worker + caption research. Smoke test is limited to 1 video by default.</p>
+    <div style={{display:'flex',gap:10,flexWrap:'wrap'}}><button onClick={discover}>Discover</button><button onClick={start}>Start 1-Video Smoke Test</button><button onClick={refresh}>Refresh</button></div>
+    <p>{msg}</p>
+    {stats&&<pre style={{background:'#111',color:'#eee',padding:20,borderRadius:10,overflow:'auto'}}>{JSON.stringify(stats,null,2)}</pre>}
+    <p>LONG videos are queued independently of upload-date availability.</p>
+  </main>
+}
+
+
+===== web/package.json =====
+{"name":"codeviser-web","private":true,"scripts":{"dev":"next dev","build":"next build","start":"next start"},"dependencies":{"next":"14.2.35","react":"18.3.1","react-dom":"18.3.1"},"devDependencies":{"typescript":"5.7.2","@types/node":"22.10.5","@types/react":"18.3.18","@types/react-dom":"18.3.5"}}
+
+
+===== web/next.config.mjs =====
+const nextConfig = { output: 'standalone' };
+export default nextConfig;
+
+
+===== web/Dockerfile =====
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+FROM node:22-alpine AS run
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+EXPOSE 3000
+CMD ["node","server.js"]
+
+
+===== docker-compose.yml =====
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: codeviser
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes: [pgdata:/var/lib/postgresql/data]
+  redis:
+    image: redis:7-alpine
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/codeviser
+      REDIS_URL: redis://redis:6379/0
+      CHANNEL_URL: https://youtube.com/@codeviser
+      MIN_LONG_SECONDS: 180
+      START_DATE: 2017-01-01
+      END_DATE: 2026-10-08
+    depends_on: [postgres, redis]
+    ports: ["8000:8000"]
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/codeviser
+      REDIS_URL: redis://redis:6379/0
+      SMOKE_ONLY: "true"
+      SMOKE_LIMIT: 1
+    depends_on: [postgres, redis]
+  web:
+    build: ./web
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on: [api]
+    ports: ["3000:3000"]
+volumes:
+  pgdata:
+
+
+===== README.md =====
+# Codeviser Research Engine — Railway MVP
+
+A real FastAPI + Redis + PostgreSQL + worker + Next.js research engine for the public Codeviser YouTube channel.
+
+## Safety / scope
+- Uses public YouTube metadata and public captions via `yt-dlp`.
+- Does **not** invent transcripts.
+- `LONG` classification is independent of upload-date availability.
+- Unknown upload dates are retained as `DATE_UNKNOWN_LONG` instead of being silently discarded.
+- The worker defaults to a **1-video smoke test** (`SMOKE_LIMIT=1`) before any full run.
+- Full-channel processing must be explicitly enabled with `SMOKE_ONLY=false`.
+- Temporary media is deleted after processing.
+
+## Services
+- `api`: FastAPI HTTP API
+- `worker`: persistent Redis-backed background worker
+- `web`: Next.js dashboard
+- `redis`: queue
+- `postgres`: persistent state
+
+## Environment
+See `.env.example`.
+
+Required for AI analysis only: `OPENAI_API_KEY` (or another OpenAI-compatible endpoint if configured). The smoke test can run without it; analysis is marked `SKIPPED_NO_API_KEY` rather than fabricated.
+
+## Local validation
+```bash
+python -m compileall api worker
+cd web && npm ci && npm run build
+```
+
+## First run
+1. Deploy the five services.
+2. Keep `SMOKE_ONLY=true` and `SMOKE_LIMIT=1`.
+3. Call `POST /research/start` once.
+4. Confirm queue/worker logs show one real LONG video.
+5. Only after that set `SMOKE_ONLY=false` for the full run.
+
+
+===== .env.example =====
+DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/codeviser
+REDIS_URL=redis://redis:6379/0
+CHANNEL_URL=https://youtube.com/@codeviser
+START_DATE=2017-01-01
+END_DATE=2026-10-08
+MIN_LONG_SECONDS=180
+BATCH_SIZE=1
+SMOKE_ONLY=true
+SMOKE_LIMIT=1
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.4
+API_BASE_URL=http://api:8000
+
