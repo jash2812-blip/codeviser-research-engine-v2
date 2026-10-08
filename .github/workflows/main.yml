@@ -1,0 +1,65 @@
+name: Install Codeviser Project
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "CODEVISER_13_FILES_SINGLE.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract 13 project files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path("CODEVISER_13_FILES_SINGLE.txt")
+          text = source.read_text(encoding="utf-8")
+
+          pattern = re.compile(
+              r"^===== (.+?) =====\n(.*?)(?=^===== |\Z)",
+              re.MULTILINE | re.DOTALL
+          )
+
+          matches = pattern.findall(text)
+
+          if len(matches) != 13:
+              raise SystemExit(
+                  f"Expected 13 files, found {len(matches)}"
+              )
+
+          for path, content in matches:
+              p = Path(path)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(content.rstrip() + "\n", encoding="utf-8")
+              print(f"Created: {path}")
+
+          print("SUCCESS: 13 project files created.")
+
+      - name: Remove source bundle
+        run: |
+          rm -f CODEVISER_13_FILES_SINGLE.txt
+
+      - name: Commit project files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Install Codeviser project structure"
+            git push
+          fi
